@@ -94,13 +94,28 @@ function chainHtml(chain) {
   }).join(' &nbsp;←&nbsp; ');
 }
 
+// 多条同刻支路各自独立成行，连续展示外部边沿 → 支路门翻转 → 汇合输出事件，
+// 不把多个直接诱因压缩成任意一条。
+function chainListHtml(chains) {
+  if (!chains?.length) return '—';
+  return chains.map((path, i) =>
+    `<div class="chain-path"><span class="branch-tag">支路 ${i + 1}</span><span class="chain-trace">${chainHtml(path)}</span></div>`).join('');
+}
+
 function pulseChainHtml(pulse) {
-  const first = pulse.chain?.[0];
-  const origin = first?.kind === 'edge'
-    ? `起因 t=${first.t} ${esc(first.input)}`
-    : first?.kind === 'powerup' ? '起因上电' : '起因待定';
-  const trace = chainHtml(pulse.chain || []);
-  return `<span class="chain-origin">${origin}</span><span class="chain-trace">${trace}</span>`;
+  const roots = (pulse.chains || []).map((c) => c[0]);
+  const first = roots[0];
+  const origin = roots.length > 1
+    ? `同刻 ${roots.length} 条支路共同触发（${roots.map((r) =>
+      r.kind === 'edge' ? `t=${r.t} ${esc(r.input)}` : '上电').join('、')}）`
+    : first?.kind === 'edge'
+      ? `起因 t=${first.t} ${esc(first.input)}`
+      : first?.kind === 'powerup' ? '起因上电' : '起因待定';
+  return `<span class="chain-origin">${origin}</span>
+    <div class="chain-list">
+      <div class="chain-group"><span class="group-tag">进入</span>${chainListHtml(pulse.chains)}</div>
+      <div class="chain-group"><span class="group-tag">退出</span>${chainListHtml(pulse.exitChains)}</div>
+    </div>`;
 }
 
 function framesTable(frames, monitors, title) {

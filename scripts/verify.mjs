@@ -2,7 +2,8 @@
 // 顺序：
 //  1) 规定场景断言：宽度 2 短脉冲及因果链；
 //     延迟 3 的 NOT 在第 0/1 刻反转时撤销第 3 刻失效翻转；
-//     正延迟反馈链振荡证据（稳定门 + 事件标识，可回放）。
+//     正延迟反馈链振荡证据（稳定门 + 事件标识，可回放）；
+//     双支路同刻汇合短脉冲（两条输入因果路径，可连续复算，录入顺序无关）。
 //  2) 代码测试（node --test）。
 //  3) 页面构建（npm run build）。
 //  4) 在可配置宿主端口启动服务，做 /health 与 /api/review 的 HTTP 冒烟。
@@ -90,6 +91,89 @@ console.log('[1/4] 规定场景断言');
   ok('振荡门包含反馈链上的门', o?.gates?.includes('G') || o?.gates?.includes('N'));
 }
 
+// 场景 D：双支路同刻汇合（本次修复目标）。两条延迟 1 的 NOT 分别接 a、b，
+// 延迟 2 的 AND 汇合；a、b 第 2 刻同时转低、第 4 刻同时恢复高，
+// AND 输出在 [5,7) 出现宽度 2 短脉冲，且进入/退出证据必须保留两条可连续复算的支路。
+const dualBranchConfig = (rev = false) => ({
+  gates: rev
+    ? [
+      { id: 'Y', type: 'AND', delay: 2, inputs: ['B', 'A'] },
+      { id: 'B', type: 'NOT', delay: 1, inputs: ['input:b'] },
+      { id: 'A', type: 'NOT', delay: 1, inputs: ['input:a'] },
+    ]
+    : [
+      { id: 'A', type: 'NOT', delay: 1, inputs: ['input:a'] },
+      { id: 'B', type: 'NOT', delay: 1, inputs: ['input:b'] },
+      { id: 'Y', type: 'AND', delay: 2, inputs: ['A', 'B'] },
+    ],
+  edges: rev
+    ? [
+      { time: 4, input: 'b', from: 0, to: 1 },
+      { time: 4, input: 'a', from: 0, to: 1 },
+      { time: 2, input: 'b', from: 1, to: 0 },
+      { time: 2, input: 'a', from: 1, to: 0 },
+    ]
+    : [
+      { time: 2, input: 'a', from: 1, to: 0 },
+      { time: 2, input: 'b', from: 1, to: 0 },
+      { time: 4, input: 'a', from: 0, to: 1 },
+      { time: 4, input: 'b', from: 0, to: 1 },
+    ],
+  initialInputs: { a: '1', b: '1' },
+  monitors: ['Y'],
+});
+{
+  const res = simulate(dualBranchConfig());
+  const p = res?.pulses?.find((x) => x.gate === 'Y');
+  ok('双支路同刻汇合：识别宽度 2 短脉冲',
+    p && p.width === 2 && p.short === true, JSON.stringify(res?.pulses));
+  ok('双支路短脉冲起止刻度为 [5,7)',
+    p && p.start === 5 && p.end === 7, `start=${p?.start} end=${p?.end}`);
+  ok('双支路短脉冲记录进入/退出事件标识',
+    p && Number.isInteger(p.enterSeq) && p.enterSeq !== p.exitSeq,
+    `enter=${p?.enterSeq} exit=${p?.exitSeq}`);
+  const roots = (p?.chains || []).map((c) => c[0]).sort((x, y) => x.input.localeCompare(y.input));
+  ok('进入证据保留 a、b 两条同刻外部边沿',
+    roots.length === 2 &&
+    roots[0]?.kind === 'edge' && roots[0].t === 2 && roots[0].input === 'a' && roots[0].to === '0' &&
+    roots[1]?.kind === 'edge' && roots[1].t === 2 && roots[1].input === 'b' && roots[1].to === '0',
+    JSON.stringify(p?.chains));
+  // 每条路径连续复算：外部边沿 → 各自 NOT 翻转 → 汇合到同一 AND 进入事件。
+  let replayOk = Array.isArray(p?.chains) && p.chains.length === 2;
+  let replayDetail = '';
+  if (replayOk) {
+    const fires = new Map(res.events.filter((e) => e.action === 'FIRE').map((e) => [e.seq, e]));
+    for (const path of p.chains) {
+      if (path[path.length - 1].seq !== p.enterSeq) { replayOk = false; replayDetail = '未汇合到进入事件'; break; }
+      const branchGate = path[1]?.gate;
+      if (!['A', 'B'].includes(branchGate)) { replayOk = false; replayDetail = '缺少支路门翻转'; break; }
+      for (let i = 1; i < path.length; i++) {
+        const ev = fires.get(path[i].seq);
+        const prev = path[i - 1];
+        const wantCause = prev.kind === 'edge' ? `edge:${prev.t}:${prev.input}` : prev.seq;
+        if (!ev || !(ev.causes || []).includes(wantCause) || !(ev.time > prev.t)) {
+          replayOk = false; replayDetail = `#${path[i].seq} 诱因断裂`; break;
+        }
+      }
+    }
+  }
+  ok('两条进入路径均可连续复算（边沿→支路翻转→汇合输出）', replayOk, replayDetail);
+  const exitRoots = (p?.exitChains || []).map((c) => c[0]).sort((x, y) => x.input.localeCompare(y.input));
+  ok('退出证据保留第 4 刻 a、b 恢复支路',
+    exitRoots.length === 2 && exitRoots.every((r, i) => r.t === 4 && r.input === (i === 0 ? 'a' : 'b') && r.to === '1'),
+    JSON.stringify(p?.exitChains));
+
+  // 录入顺序（门/连线/边沿）变化不得改变事件标识、脉冲边界、裁决哈希与因果证据。
+  const rev = simulate(dualBranchConfig(true));
+  const rp = rev?.pulses?.find((x) => x.gate === 'Y');
+  ok('录入顺序反转：事件标识、脉冲边界、裁决与证据不变',
+    rp && rp.start === p.start && rp.end === p.end && rp.width === p.width &&
+    rp.enterSeq === p.enterSeq && rp.exitSeq === p.exitSeq &&
+    rev.status === res.status && rev.normalized.hash === res.normalized.hash &&
+    JSON.stringify(rp.chains) === JSON.stringify(p.chains) &&
+    JSON.stringify(rp.exitChains) === JSON.stringify(p.exitChains));
+}
+
 console.log('[2/4] 代码测试');
 const run = (cmd, args) => new Promise((resolve) => {
   const p = spawn(cmd, args, { stdio: 'inherit', shell: process.platform === 'win32' });
@@ -138,6 +222,25 @@ console.log(`[4/4] HTTP 冒烟（宿主 ${HOST}:${PORT}）`);
     const body = await pr.json();
     reviewOk = pr.status === 200 && body.ok && body.status === 'STABLE' && body.stableValues.N === '1';
     ok('POST /api/review 返回静稳结论（撤销场景）', reviewOk);
+
+    // 双支路同刻汇合复核请求：经 HTTP 提交修复场景，核对脉冲边界与两条输入因果路径。
+    const dr = await fetch(`http://${HOST}:${PORT}/api/review`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(dualBranchConfig()),
+    });
+    const db = await dr.json();
+    const dp = db.pulses?.find((x) => x.gate === 'Y');
+    const dRoots = (dp?.chains || []).map((c) => c[0]).sort((x, y) => x.input.localeCompare(y.input));
+    const dualHttpOk = dr.status === 200 && db.ok && db.status === 'STABLE' &&
+      dp && dp.start === 5 && dp.end === 7 && dp.width === 2 &&
+      dp.chains?.length === 2 && dp.exitChains?.length === 2 &&
+      dRoots.length === 2 && dRoots[0].input === 'a' && dRoots[1].input === 'b' &&
+      dRoots.every((r) => r.t === 2 && r.from === '1' && r.to === '0') &&
+      dp.chains.every((path) =>
+        path[0].kind === 'edge' && path.at(-1).seq === dp.enterSeq &&
+        path.some((n) => n.kind === 'fire' && n.gate === 'Y' && n.seq === dp.enterSeq));
+    ok('POST /api/review 返回双支路短脉冲及两条可复算因果路径', dualHttpOk, JSON.stringify(dp?.chains));
 
     const page = await fetch(`http://${HOST}:${PORT}/`);
     const html = await page.text();

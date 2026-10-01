@@ -196,6 +196,122 @@ test('规范化配置：相同结构不同录入顺序得到同一哈希', () =>
   assert.equal(a.hash, b.hash);
 });
 
+// 双支路同刻汇合：两条延迟 1 的 NOT 分别接外部输入 a、b，延迟 2 的 AND 汇合两输出。
+// a、b 初始高，第 2 刻同时转低、第 4 刻同时恢复高 → AND 输出在 [5,7) 出现宽度 2 短脉冲。
+// rev=true 时反转门、连线与边沿的录入顺序，用于核对事件标识与证据完整性不受影响。
+function dualBranchConfig(rev = false) {
+  return {
+    gates: rev
+      ? [
+        { id: 'Y', type: 'AND', delay: 2, inputs: ['B', 'A'] },
+        { id: 'B', type: 'NOT', delay: 1, inputs: ['input:b'] },
+        { id: 'A', type: 'NOT', delay: 1, inputs: ['input:a'] },
+      ]
+      : [
+        { id: 'A', type: 'NOT', delay: 1, inputs: ['input:a'] },
+        { id: 'B', type: 'NOT', delay: 1, inputs: ['input:b'] },
+        { id: 'Y', type: 'AND', delay: 2, inputs: ['A', 'B'] },
+      ],
+    edges: rev
+      ? [
+        { time: 4, input: 'b', from: 0, to: 1 },
+        { time: 4, input: 'a', from: 0, to: 1 },
+        { time: 2, input: 'b', from: 1, to: 0 },
+        { time: 2, input: 'a', from: 1, to: 0 },
+      ]
+      : [
+        { time: 2, input: 'a', from: 1, to: 0 },
+        { time: 2, input: 'b', from: 1, to: 0 },
+        { time: 4, input: 'a', from: 0, to: 1 },
+        { time: 4, input: 'b', from: 0, to: 1 },
+      ],
+    initialInputs: { a: '1', b: '1' },
+    monitors: ['Y'],
+  };
+}
+
+// 连续复算一条因果路径：逐跳核对事件流水里记录的直接诱因确实包含上一跳，
+// 且时间严格向前（外部边沿 → 支路门翻转 → … → 汇合输出事件）。
+function replayChain(res, path, finalSeq) {
+  assert.ok(path.length >= 2, '因果路径至少含外部边沿与一个门翻转');
+  assert.equal(path[0].kind, 'edge', '路径起点必须是外部边沿');
+  assert.equal(path[path.length - 1].kind, 'fire');
+  assert.equal(path[path.length - 1].seq, finalSeq, '路径终点必须汇合到指定输出事件');
+  const fires = res.events.filter((e) => e.action === 'FIRE');
+  for (let i = 1; i < path.length; i++) {
+    const node = path[i];
+    assert.equal(node.kind, 'fire');
+    assert.ok(node.t > path[i - 1].t, `第 ${i} 跳时间必须向前`);
+    const ev = fires.find((e) => e.seq === node.seq);
+    assert.ok(ev, `事件 #${node.seq} 必须存在于事件流水`);
+    assert.equal(ev.gate, node.gate);
+    assert.equal(ev.time, node.t);
+    const prev = path[i - 1];
+    const expectedCause = prev.kind === 'edge' ? `edge:${prev.t}:${prev.input}` : prev.seq;
+    assert.ok(ev.causes.includes(expectedCause),
+      `#${node.seq} 的直接诱因应包含上一跳 ${JSON.stringify(expectedCause)}，实际 ${JSON.stringify(ev.causes)}`);
+  }
+}
+
+test('双支路同刻汇合：短脉冲起止/宽度/进入事件与两条可连续复算的输入因果路径', () => {
+  const res = simulate(dualBranchConfig());
+  assert.equal(res.ok, true);
+  assert.equal(res.status, 'STABLE');
+  const p = res.pulses.find((x) => x.gate === 'Y');
+  assert.ok(p, '应识别 AND 输出 Y 上的短脉冲');
+  assert.equal(p.start, 5);
+  assert.equal(p.end, 7);
+  assert.equal(p.width, 2);
+  assert.equal(p.short, true);
+  assert.ok(Number.isInteger(p.enterSeq) && Number.isInteger(p.exitSeq));
+  assert.notEqual(p.enterSeq, p.exitSeq);
+
+  // 进入翻转必须由两条同刻支路共同建立，各保留一条完整因果路径。
+  assert.ok(Array.isArray(p.chains));
+  assert.equal(p.chains.length, 2, '进入翻转应保留两条支路，不得压缩为任意一条');
+  const roots = p.chains.map((c) => c[0]).sort((x, y) => x.input.localeCompare(y.input));
+  assert.deepEqual(roots.map((r) => [r.kind, r.t, r.input, r.from, r.to]),
+    [['edge', 2, 'a', '1', '0'], ['edge', 2, 'b', '1', '0']]);
+  const branchGates = p.chains.map((c) => c.slice(1, -1).map((n) => n.gate));
+  assert.deepEqual(branchGates.sort((x, y) => String(x).localeCompare(String(y))), [['A'], ['B']]);
+  for (const path of p.chains) {
+    assert.equal(path[path.length - 1].seq, p.enterSeq, '两条路径必须汇合到同一进入事件');
+    replayChain(res, path, p.enterSeq);
+  }
+
+  // 退出翻转同样由两条同刻恢复支路共同撤除。
+  assert.equal(p.exitChains.length, 2);
+  const exitRoots = p.exitChains.map((c) => c[0]).sort((x, y) => x.input.localeCompare(y.input));
+  assert.deepEqual(exitRoots.map((r) => [r.t, r.input, r.from, r.to]),
+    [[4, 'a', '0', '1'], [4, 'b', '0', '1']]);
+  for (const path of p.exitChains) replayChain(res, path, p.exitSeq);
+
+  // 兼容字段：首条进入路径。
+  assert.deepEqual(p.chain, p.chains[0]);
+});
+
+test('双支路同刻汇合：门/连线/边沿录入顺序变化不影响事件标识、脉冲边界与因果证据', () => {
+  const a = simulate(dualBranchConfig(false));
+  const b = simulate(dualBranchConfig(true));
+  const pa = a.pulses.find((x) => x.gate === 'Y');
+  const pb = b.pulses.find((x) => x.gate === 'Y');
+  assert.equal(a.status, b.status);
+  assert.equal(a.normalized.hash, b.normalized.hash);
+  for (const k of ['start', 'end', 'width', 'short', 'enterSeq', 'exitSeq']) {
+    assert.equal(pa[k], pb[k], `字段 ${k} 不应随录入顺序变化`);
+  }
+  assert.deepEqual(pa.chains, pb.chains);
+  assert.deepEqual(pa.exitChains, pb.exitChains);
+});
+
+test('单支路脉冲仍只产出一条因果路径（多诱因修复不污染单支路语义）', () => {
+  const res = simulate(pulseConfig());
+  const p = res.pulses.find((x) => x.gate === 'Y');
+  assert.equal(p.chains.length, 1);
+  assert.equal(p.exitChains.length, 1);
+  replayChain(res, p.chains[0], p.enterSeq);
+});
+
 test('校验失败时 simulate 返回错误且不产出旧结论', () => {
   const res = simulate({ gates: [], edges: [], monitors: [] });
   assert.equal(res.ok, false);

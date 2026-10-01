@@ -1,0 +1,27 @@
+services:
+  review:
+    build: .
+    image: inertial-logic-review:latest
+    environment:
+      # 可配置宿主端口：宿主机 ${HOST:-0.0.0.0}:${PORT:-8080} -> 容器 8080
+      HOST: 0.0.0.0
+      PORT: "8080"
+    ports:
+      - "${HOST:-0.0.0.0}:${PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # 一次性验收服务：构建镜像 -> 运行规定场景断言、代码测试、页面构建、HTTP 冒烟 -> 退出。
+  # 用法：docker compose --profile verify run --rm verify；退出码即验收结果。
+  verify:
+    profiles: ["verify"]
+    build: .
+    image: inertial-logic-review:latest
+    environment:
+      HOST: 127.0.0.1
+      PORT: "8091"
+    entrypoint: ["node", "scripts/verify.mjs"]

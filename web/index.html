@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>冗余离散链路惯性延迟复核</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header>
+    <h1>冗余离散链路惯性延迟复核</h1>
+    <p class="sub">NOT / AND / OR 门 · 正整数惯性延迟 · 待发事件撤销 · 短脉冲与振荡识别</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="card-head">
+        <h2>1. 门定义（最多 12 个，标识唯一）</h2>
+        <button type="button" id="addGate" class="ghost">＋ 添加门</button>
+      </div>
+      <div id="gateRows"></div>
+      <p class="hint">连线填门标识（取其输出）或 <code>input:名称</code>（外部输入），多条用逗号分隔。NOT 恰好 1 条；AND/OR 至少 1 条。</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>2. 外部边沿表</h2>
+        <button type="button" id="addEdge" class="ghost">＋ 添加边沿</button>
+      </div>
+      <table class="grid" id="edgeTable">
+        <thead><tr><th>刻度</th><th>外部输入</th><th>from</th><th>to</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="hint">刻度为非负整数；同输入相邻边沿的 from/to 必须衔接。初始电平取该输入最早边沿的 from。</p>
+    </section>
+
+    <section class="card">
+      <h2>3. 受监控输出</h2>
+      <input id="monitors" type="text" placeholder="门标识，逗号分隔；留空则监控全部门" />
+      <h2 class="mt">初始输入电平（可选）</h2>
+      <input id="initialInputs" type="text" placeholder="如 a=1, en_n=0；缺省为 0 或最早边沿的 from" />
+    </section>
+
+    <div class="actions">
+      <button type="button" id="submit" class="primary">提交复核</button>
+      <button type="button" id="clear" class="danger">清空草稿</button>
+      <span id="draftNote" class="hint"></span>
+    </div>
+
+    <section id="result" class="card hidden" aria-live="polite"></section>
+  </main>
+
+  <footer>
+    <span>惯性延迟事件驱动仿真 · 同刻事件按标识稳定处理</span>
+  </footer>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

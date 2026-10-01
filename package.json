@@ -1,0 +1,17 @@
+{
+  "name": "inertial-logic-review",
+  "version": "1.0.0",
+  "description": "冗余离散链路惯性延迟复核：短脉冲 / 失效翻转撤销 / 振荡检测",
+  "type": "module",
+  "main": "src/sim.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "build": "node scripts/build.mjs",
+    "test": "node --test",
+    "verify": "node scripts/verify.mjs"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.23.1"
+  }
+}

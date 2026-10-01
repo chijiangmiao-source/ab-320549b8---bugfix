@@ -75,7 +75,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   server.listen(PORT, HOST, () => {
     console.log(`[server] 惯性延迟复核服务监听 http://${HOST}:${PORT}（健康检查 /health）`);
   });
-  const shutdown = () => server.close(() => process.exit(0));
+  const shutdown = () => {
+    // 立即释放 keep-alive 空闲连接，避免一次性验收（spawn 后 SIGTERM）残留占端口。
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    server.close(() => process.exit(0));
+  };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }

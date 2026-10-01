@@ -52,6 +52,91 @@ test('脉冲宽度 3 不判为短脉冲（宽于惯性延迟 2）', () => {
   assert.ok(!wide || wide.short === false);
 });
 
+// 双支路同刻汇合：两个延迟 1 的 NOT（外部输入 a、b 初值 1，t=2 同刻拉低、t=4 同刻恢复）
+// 共同驱动延迟 2 的 AND；Y 在 [5,7) 输出宽度 2 的短脉冲。
+// 该脉冲的进入翻转同时依赖两条支路，因果证据必须给出两条可独立复算的路径，
+// 不得压缩为任意一条。
+function dualBranchConfig() {
+  return {
+    gates: [
+      { id: 'NA', type: 'NOT', delay: 1, inputs: ['input:a'] },
+      { id: 'NB', type: 'NOT', delay: 1, inputs: ['input:b'] },
+      { id: 'Y', type: 'AND', delay: 2, inputs: ['NA', 'NB'] },
+    ],
+    edges: [
+      { time: 2, input: 'a', from: 1, to: 0 },
+      { time: 2, input: 'b', from: 1, to: 0 },
+      { time: 4, input: 'a', from: 0, to: 1 },
+      { time: 4, input: 'b', from: 0, to: 1 },
+    ],
+    initialInputs: { a: '1', b: '1' },
+    monitors: ['Y'],
+  };
+}
+
+test('双支路同刻汇合：短脉冲边界、宽度、进入事件与两条可复算因果路径', () => {
+  const res = simulate(dualBranchConfig());
+  assert.equal(res.ok, true);
+  assert.equal(res.status, 'STABLE');
+  const p = res.pulses.find((x) => x.gate === 'Y');
+  assert.ok(p, '应检测到受监控输出 Y 上的短脉冲');
+  assert.equal(p.start, 5);
+  assert.equal(p.end, 7);
+  assert.equal(p.width, 2);
+  assert.equal(p.short, true);
+  assert.equal(p.converged, true);
+  // 进入事件是同刻双诱因的汇合翻转
+  const enter = res.events.find((e) => e.action === 'FIRE' && e.seq === p.enterSeq);
+  assert.deepEqual(enter.causes, [1, 2]);
+
+  const chains = p.chains;
+  assert.ok(Array.isArray(chains) && chains.length === 2, `应给出 2 条因果路径，实际 ${chains?.length}`);
+  const byInput = new Map();
+  for (const ch of chains) {
+    assert.equal(ch[0].kind, 'edge', '每条路径起点必须是外部边沿');
+    assert.equal(ch[ch.length - 1].kind, 'fire');
+    assert.equal(ch[ch.length - 1].seq, p.enterSeq, '每条路径终点必须是同一个汇合进入事件');
+    byInput.set(ch[0].input, ch);
+  }
+  for (const input of ['a', 'b']) {
+    const ch = byInput.get(input);
+    assert.ok(ch, `缺少 ${input} 支路因果路径`);
+    assert.equal(ch[0].t, 2);
+    assert.equal(ch[0].from, '1');
+    assert.equal(ch[0].to, '0');
+    // 中间为对应 NOT 门在第 3 刻的翻转
+    const notFire = ch.find((c) => c.kind === 'fire' && c.gate === (input === 'a' ? 'NA' : 'NB'));
+    assert.ok(notFire, `${input} 支路缺少对应 NOT 门翻转`);
+    assert.equal(notFire.t, 3);
+    assert.equal(notFire.to, '1');
+  }
+  // 兼容字段 chain 仍指向其中一条稳定主路径
+  assert.ok(p.chain.some((c) => c.kind === 'fire' && c.gate === 'Y' && c.seq === p.enterSeq));
+});
+
+test('双支路同刻汇合：门/连线/边沿录入顺序变化不改变标识、边界与证据', () => {
+  const base = dualBranchConfig();
+  const variants = {
+    原序: base,
+    门逆序: { ...base, gates: [base.gates[2], base.gates[1], base.gates[0]] },
+    边沿逆序: { ...base, edges: [...base.edges].reverse() },
+    连线交换: { ...base, gates: base.gates.map((g) => (g.id === 'Y' ? { ...g, inputs: ['NB', 'NA'] } : g)) },
+  };
+  const sig = (res) => {
+    const p = res.pulses.find((x) => x.gate === 'Y');
+    return JSON.stringify({
+      status: res.status,
+      pulse: { start: p.start, end: p.end, width: p.width, enterSeq: p.enterSeq, exitSeq: p.exitSeq },
+      chains: p.chains,
+    });
+  };
+  const first = simulate(variants.原序);
+  for (const [name, cfg] of Object.entries(variants)) {
+    const r = simulate(cfg);
+    assert.equal(sig(r), sig(first), `${name} 的脉冲边界/事件标识/因果证据必须一致`);
+  }
+});
+
 // 场景二：延迟为 3 的 NOT 门在第 0、1 刻反转时，第 3 刻失效翻转必须被撤销、不得落入轨迹。
 test('NOT 延迟 3：t=0 与 t=1 连续反转，t=3 失效翻转被撤销', () => {
   const cfg = {

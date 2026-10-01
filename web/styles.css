@@ -63,6 +63,9 @@ td.v0 { color: var(--muted); }
 ul.errors { margin: 8px 0 0; padding-left: 18px; }
 ul.errors li { color: #ffc9c9; font-size: 13px; margin: 3px 0; }
 .chain { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: #b9d6ff; margin: 4px 0 0; }
+.chain-branch { margin: 2px 0; padding: 2px 6px; border-left: 2px solid rgba(242,184,75,.55); }
+.chain-converge { color: var(--warn, #f2b84b); font-size: 12px; margin-bottom: 3px; font-weight: 700; }
+.converge { color: var(--warn, #f2b84b); margin-left: 6px; font-weight: 700; }
 .sec-title { font-size: 14px; margin: 16px 0 6px; }
 .kv { color: var(--muted); font-size: 12.5px; }
 footer { text-align: center; color: var(--muted); font-size: 12px; padding: 16px; border-top: 1px solid var(--line); }

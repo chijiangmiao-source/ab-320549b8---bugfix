@@ -242,6 +242,18 @@ function computeGate(g, values, inputs) {
 
 const edgeCause = (t, input) => `edge:${t}:${input}`;
 
+// 诱因标识为事件 seq（number）或 edge:t:input（string）/null（上电）。
+// 同一事件的多个直接诱因必须按与录入顺序无关的稳定规则排序，
+// 避免同刻多支路汇合时因果证据丢失或随录入顺序变化。
+const causeCmp = (x, y) => {
+  if (x === y) return 0;
+  if (x == null) return -1;
+  if (y == null) return 1;
+  const sx = String(x), sy = String(y);
+  return sx < sy ? -1 : sx > sy ? 1 : 0;
+};
+const uniqCauses = (list) => [...new Set(list)].sort(causeCmp);
+
 /**
  * 执行仿真并返回完整复核结论。
  * config: { gates, edges, monitors, initialInputs? }
@@ -259,8 +271,17 @@ export function simulate(config, options = {}) {
   const values = new Map();
   for (const g of gates) values.set(g.id, '0'); // 确定性上电约定：门输出初值 0
 
+  // 当前值出处：门当前输出由哪次生效翻转建立（null=上电初值）；
+  // 外部输入当前电平由哪条外部边沿建立（null=初始电平，静态背景）。
+  // 调度待发事件时据此直接计算控制输入的诱因集合，
+  // 使同刻多支路汇合被完整记录，且与录入/到达顺序无关。
+  const valueOrigin = new Map();
+  for (const g of gates) valueOrigin.set(g.id, null);
+  const inputOrigin = new Map();
+  for (const name of model.externalInputs) inputOrigin.set(name, null);
+
   let eventSeq = 0;
-  const pending = new Map(); // gateId -> 待发事件 {seq,time,to,born,cause} 或 null
+  const pending = new Map(); // gateId -> 待发事件 {seq,time,to,born,cause,causes} 或 null
   for (const g of gates) pending.set(g.id, null);
   const eventsLog = [];
   const timeline = [];
@@ -275,28 +296,72 @@ export function simulate(config, options = {}) {
 
   const sortedIds = gates.map((g) => g.id).sort();
 
-  // 重算门 g：必要时安排/撤销待发事件。cause 为本次重算的诱因（事件 seq 或 edge:t:name）。
-  const reconsider = (g, t, causes) => {
-    const cause = causes[causes.length - 1] ?? null;
+  // 计算使门 g 当前输出为 want 的控制输入出处集合：
+  //  NOT：唯一输入；AND→1：全部输入；AND→0：当前为 0 的输入（任一 0 即决定）；
+  //  OR→0：全部输入；OR→1：当前为 1 的输入。
+  // 出处为 FIRE 事件 seq（门输入）或 'edge:t:name'（外部输入）或 null（静态初值）。
+  const controllingCauses = (g, want) => {
+    const out = [];
+    for (const link of g.inputs) {
+      if (link.kind === 'input') {
+        if (!inputValues.has(link.name) || inputValues.get(link.name) === 'x') continue;
+        const controlling =
+          g.type === 'NOT' ? true
+          : g.type === 'AND' ? (want === '1' || inputValues.get(link.name) === '0')
+          : (want === '0' || inputValues.get(link.name) === '1');
+        if (controlling) out.push(inputOrigin.get(link.name) ?? null);
+      } else {
+        if (!values.has(link.id) || values.get(link.id) === 'x') continue;
+        const controlling =
+          g.type === 'NOT' ? true
+          : g.type === 'AND' ? (want === '1' || values.get(link.id) === '0')
+          : (want === '0' || values.get(link.id) === '1');
+        if (controlling) out.push(valueOrigin.get(link.id));
+      }
+    }
+    return uniqCauses(out);
+  };
+
+  // 重算门 g：必要时安排/撤销待发事件。诱因从各控制输入的当前值出处直接计算，
+  // 同刻多支路（如 AND 两输入同刻变化）作为多个直接诱因共同保留；
+  // 已安排但尚未生效的中间变化不会污染目标事件的因果证据。
+  const reconsider = (g, t) => {
     const want = computeGate(g, values, inputValues);
     const cur = values.get(g.id);
     const p = pending.get(g.id);
     if (want === 'x') return null;
+    // 建立当前计算值 want 的控制输入出处，即本次安排/撤销/延续的诱因。
+    // 静态初值（null）仅当它是唯一诱因时保留——用于反馈环门上电失配自启动；
+    // 若已存在真实事件诱因（外部边沿/门翻转），从未变化的静态背景不另立支路。
+    const rawCauses = controllingCauses(g, want);
+    const causes = rawCauses.some((c) => c != null) ? rawCauses.filter((c) => c != null) : rawCauses;
+    const cause = causes[causes.length - 1] ?? null;
     if (want === cur) {
       if (p) {
         pending.set(g.id, null);
-        eventsLog.push({ seq: p.seq, time: t, gate: g.id, action: 'CANCEL', wasTo: p.to, cause });
-        return { action: 'CANCEL', gate: g.id, seq: p.seq, wasTo: p.to, cause };
+        eventsLog.push({ seq: p.seq, time: t, gate: g.id, action: 'CANCEL', wasTo: p.to, cause, causes: [...causes] });
+        return { action: 'CANCEL', gate: g.id, seq: p.seq, wasTo: p.to, cause, causes: [...causes] };
       }
       return null;
     }
-    if (p && p.to === want) return null; // 同目标待发事件保留：惯性窗口延续
-    if (p) eventsLog.push({ seq: p.seq, time: t, gate: g.id, action: 'CANCEL', wasTo: p.to, cause });
+    if (p && p.to === want) {
+      // 同目标待发事件保留：惯性窗口延续（出生时刻/生效时刻不变）。
+      // 但诱因要刷新为当前控制输入出处：窗口内可能发生支路交棒或新支路汇入
+      // （如 AND→0 期间第二个输入也变 0），证据须反映翻转生效时实际依赖的全部支路。
+      const same = p.causes.length === causes.length && p.causes.every((c, i) => causeCmp(c, causes[i]) === 0);
+      if (!same) {
+        p.causes = [...causes];
+        p.cause = cause;
+        eventsLog.push({ seq: p.seq, time: t, gate: g.id, action: 'CAUSE_REFRESH', to: want, at: p.time, cause, causes: [...causes] });
+      }
+      return null;
+    }
+    if (p) eventsLog.push({ seq: p.seq, time: t, gate: g.id, action: 'CANCEL', wasTo: p.to, cause, causes });
     const seq = ++eventSeq;
     const ev = { seq, time: t + g.delay, gate: g.id, to: want, born: t, cause, causes: [...causes] };
     pending.set(g.id, ev);
-    eventsLog.push({ seq, time: t, gate: g.id, action: 'SCHEDULE', to: want, at: ev.time, born: t, cause });
-    return { action: 'SCHEDULE', gate: g.id, seq, to: want, at: ev.time, cause };
+    eventsLog.push({ seq, time: t, gate: g.id, action: 'SCHEDULE', to: want, at: ev.time, born: t, cause, causes: [...causes] });
+    return { action: 'SCHEDULE', gate: g.id, seq, to: want, at: ev.time, cause, causes: [...causes] };
   };
 
   // 上电组合稳态：先直接求值组合部分（环外门按拓扑传播；环内门保持初值 0），
@@ -318,7 +383,7 @@ export function simulate(config, options = {}) {
       }
     }
     for (const id of sortedIds) if (!done.has(id)) done.add(id);
-    for (const id of sortedIds) reconsider(gateMap.get(id), 0, [null]);
+    for (const id of sortedIds) reconsider(gateMap.get(id), 0);
   }
 
   const signatures = new Map(); // 规范化状态签名 -> 首次出现刻度
@@ -336,6 +401,7 @@ export function simulate(config, options = {}) {
     const ext = (edgeByTime.get(t) || []).slice().sort((a, b) => a.input.localeCompare(b.input));
     for (const e of ext) {
       inputValues.set(e.input, e.to);
+      inputOrigin.set(e.input, edgeCause(t, e.input));
       external.push({ input: e.input, from: e.from, to: e.to });
     }
 
@@ -347,42 +413,35 @@ export function simulate(config, options = {}) {
     }
     for (const ev of due) {
       values.set(ev.gate, ev.to);
+      valueOrigin.set(ev.gate, ev.seq);
       pending.set(ev.gate, null);
       fired.push({ seq: ev.seq, gate: ev.gate, to: ev.to, born: ev.born, cause: ev.cause, causes: ev.causes });
       eventsLog.push({ seq: ev.seq, time: t, gate: ev.gate, action: 'FIRE', to: ev.to, cause: ev.cause, causes: ev.causes });
     }
 
-    // 3) 同刻重算定点：脏门集合携带诱因，按门标识稳定迭代到本刻无新结论。
-    const dirty = new Map(); // gateId -> 同刻到达的诱因集合
-    const seed = (id, cause) => {
-      if (!dirty.has(id)) dirty.set(id, []);
-      const causes = dirty.get(id);
-      if (!causes.includes(cause)) causes.push(cause);
-    };
+    // 3) 同刻重算定点：脏门集合只作重算标记（诱因在 reconsider 内从当前值出处
+    // 直接计算），按门标识稳定迭代到本刻无新安排/撤销。
+    const dirty = new Set();
     for (const e of ext) {
-      const cause = edgeCause(t, e.input);
       for (const g of gates) {
-        if (g.inputs.some((l) => l.kind === 'input' && l.name === e.input)) seed(g.id, cause);
+        if (g.inputs.some((l) => l.kind === 'input' && l.name === e.input)) dirty.add(g.id);
       }
     }
     for (const f of fired) {
-      seed(f.gate, f.seq); // 自环门
+      dirty.add(f.gate); // 自环门
       for (const g of gates) {
-        if (g.inputs.some((l) => l.kind === 'gate' && l.id === f.gate)) seed(g.id, f.seq);
+        if (g.inputs.some((l) => l.kind === 'gate' && l.id === f.gate)) dirty.add(g.id);
       }
     }
     let guard = 0;
     while (dirty.size > 0 && guard++ < gates.length * 6 + 8) {
-      const id = [...dirty.keys()].sort()[0];
-      const causes = dirty.get(id);
+      const id = [...dirty].sort()[0];
       dirty.delete(id);
-      const r = reconsider(gateMap.get(id), t, causes);
+      const r = reconsider(gateMap.get(id), t);
       if (r) {
         if (r.action === 'CANCEL') cancelled.push(r);
         for (const dg of gates) {
-          if (dg.inputs.some((l) => l.kind === 'gate' && l.id === id)) {
-            for (const cause of causes) seed(dg.id, cause);
-          }
+          if (dg.inputs.some((l) => l.kind === 'gate' && l.id === id)) dirty.add(dg.id);
         }
       }
     }
@@ -509,30 +568,58 @@ function detectPulses(timeline, monitors, gateMap, eventsLog, edges) {
   }
 
   const edgeTable = new Map(edges.map((e) => [`${e.time}:${e.input}`, e]));
-  const bySeq = new Map(eventsLog.map((e) => [e.seq, e]));
+  // 同一 seq 同时存在 SCHEDULE 与 FIRE 记录；因果追踪只沿实际生效翻转。
+  const fireBySeq = new Map();
+  for (const e of eventsLog) if (e.action === 'FIRE') fireBySeq.set(e.seq, e);
 
-  const buildChain = (seq) => {
-    const chain = [];
-    let cur = bySeq.get(seq);
-    const seen = new Set();
-    while (cur && !seen.has(cur.seq)) {
-      seen.add(cur.seq);
-      chain.unshift({ kind: 'fire', seq: cur.seq, gate: cur.gate, t: cur.time, to: cur.to });
-      const cause = cur.cause;
-      if (cause == null) { chain.unshift({ kind: 'powerup', note: '上电初始状态' }); break; }
-      if (typeof cause === 'string' && cause.startsWith('edge:')) {
-        const [, ts, ...rest] = cause.split(':');
-        const input = rest.join(':');
-        const e = edgeTable.get(`${Number(ts)}:${input}`);
-        chain.unshift(e
-          ? { kind: 'edge', t: e.time, input: e.input, from: e.from, to: e.to }
-          : { kind: 'edge', ref: cause });
-        break;
+  const edgeNode = (cause) => {
+    const [, ts, ...rest] = cause.split(':');
+    const input = rest.join(':');
+    const e = edgeTable.get(`${Number(ts)}:${input}`);
+    return e
+      ? { kind: 'edge', t: e.time, input: e.input, from: e.from, to: e.to }
+      : { kind: 'edge', ref: cause };
+  };
+  const fireNode = (e) => ({ kind: 'fire', seq: e.seq, gate: e.gate, t: e.time, to: e.to });
+  const pathKey = (path) => path.map((n) =>
+    (n.kind === 'fire' ? `f:${n.seq}` : n.kind === 'edge' ? `e:${n.t}:${n.input ?? n.ref}` : n.kind))
+    .join('>');
+
+  /**
+   * 从进入翻转事件出发，沿完整直接诱因集合枚举全部端到端因果路径：
+   * 每条路径为 [外部边沿|上电初值, …中间门翻转, 汇合输出翻转]（按因果时间顺序）。
+   * 同刻多支路汇合（如 AND 两个输入同刻变化）时不得压缩为任意一条。
+   */
+  const buildChains = (seq) => {
+    const enter = fireBySeq.get(seq);
+    if (!enter) return [];
+    // prefixes(ev)：所有“根 → … → ev”的路径前缀。
+    const prefixes = (ev, seen) => {
+      const node = fireNode(ev);
+      const raw = Array.isArray(ev.causes) && ev.causes.length
+        ? ev.causes
+        : (ev.cause == null ? [] : [ev.cause]);
+      const roots = [];
+      for (const c of uniqCauses(raw)) {
+        if (c == null) {
+          roots.push([{ kind: 'powerup', note: '上电初始状态' }]);
+        } else if (typeof c === 'string' && c.startsWith('edge:')) {
+          roots.push([edgeNode(c)]);
+        } else if (typeof c === 'number') {
+          const pred = fireBySeq.get(c);
+          if (!pred) roots.push([{ kind: 'unknown', seq: c }]);
+          else if (seen.has(c)) roots.push([{ kind: 'cycle', seq: c }]);
+          else for (const p of prefixes(pred, new Set(seen).add(c))) roots.push(p);
+        } else {
+          roots.push([{ kind: 'unknown', ref: String(c) }]);
+        }
       }
-      cur = bySeq.get(cause);
-      if (!cur) { chain.unshift({ kind: 'unknown', seq: cause }); break; }
-    }
-    return chain;
+      return roots.map((p) => [...p, node]);
+    };
+    const paths = prefixes(enter, new Set([seq]));
+    const dedup = new Map();
+    for (const p of paths) if (!dedup.has(pathKey(p))) dedup.set(pathKey(p), p);
+    return [...dedup.values()].sort((a, b) => pathKey(a).localeCompare(pathKey(b)));
   };
 
   const pulses = [];
@@ -545,6 +632,13 @@ function detectPulses(timeline, monitors, gateMap, eventsLog, edges) {
       if (run.end == null) continue;
       if (before.level !== run.level && after.level === before.level) {
         const width = run.end - run.start;
+        const chains = buildChains(run.enterSeq);
+        const enterFire = fireBySeq.get(run.enterSeq);
+        const enterCauses = enterFire
+          ? uniqCauses(enterFire.causes?.length ? enterFire.causes : [enterFire.cause])
+          : [];
+        // 进入翻转存在两个及以上直接诱因（含同刻双支路）时，标记汇合事件。
+        const converged = enterCauses.length >= 2;
         pulses.push({
           gate: id,
           level: run.level,
@@ -555,7 +649,12 @@ function detectPulses(timeline, monitors, gateMap, eventsLog, edges) {
           short: width <= gateMap.get(id).delay,
           enterSeq: run.enterSeq,
           exitSeq: after.enterSeq,
-          chain: buildChain(run.enterSeq),
+          converged,
+          branchCount: chains.length,
+          // chain：稳定主路径（按诱因排序的第一条端到端路径），向后兼容；
+          // chains：全部可独立复算的输入因果路径，多直接诱因不压缩。
+          chain: chains[0] ?? [],
+          chains,
         });
       }
     }

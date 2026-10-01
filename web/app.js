@@ -90,17 +90,32 @@ function chainHtml(chain) {
     if (c.kind === 'edge') return `边沿 t=${c.t} ${esc(c.input)}:${c.from}→${c.to}`;
     if (c.kind === 'fire') return `#${c.seq} ${esc(c.gate)}→${c.to}@t${c.t}`;
     if (c.kind === 'powerup') return '上电初值';
+    if (c.kind === 'cycle') return `#${c.seq}（反馈环内）`;
     return JSON.stringify(c);
-  }).join(' &nbsp;←&nbsp; ');
+  }).join(' &nbsp;→&nbsp; ');
 }
 
 function pulseChainHtml(pulse) {
-  const first = pulse.chain?.[0];
-  const origin = first?.kind === 'edge'
-    ? `起因 t=${first.t} ${esc(first.input)}`
-    : first?.kind === 'powerup' ? '起因上电' : '起因待定';
-  const trace = chainHtml(pulse.chain || []);
-  return `<span class="chain-origin">${origin}</span><span class="chain-trace">${trace}</span>`;
+  const chains = pulse.chains?.length ? pulse.chains : (pulse.chain?.length ? [pulse.chain] : []);
+  if (!chains.length) return '<span class="chain-trace">起因待定</span>';
+  if (chains.length === 1) {
+    const first = chains[0][0];
+    const origin = first?.kind === 'edge'
+      ? `起因 t=${first.t} ${esc(first.input)}`
+      : first?.kind === 'powerup' ? '起因上电' : '起因待定';
+    return `<span class="chain-origin">${origin}</span><span class="chain-trace">${chainHtml(chains[0])}</span>`;
+  }
+  // 多条可独立复算的输入因果路径（同刻多支路汇合）：逐条回放，不得压缩为一条。
+  const rows = chains.map((ch, i) => {
+    const root = ch[0];
+    const rootTxt = root?.kind === 'edge'
+      ? `支路 ${i + 1}：边沿 t=${root.t} ${esc(root.input)}:${root.from}→${root.to}`
+      : root?.kind === 'powerup' ? `支路 ${i + 1}：上电初值` : `支路 ${i + 1}`;
+    const joinSeq = pulse.enterSeq;
+    const trace = chainHtml(ch);
+    return `<div class="chain-branch"><span class="chain-origin">${rootTxt}</span><span class="chain-trace">${trace}</span>${ch[ch.length - 1]?.seq === joinSeq ? '<span class="converge">⇢ 汇合 #' + joinSeq + '</span>' : ''}</div>`;
+  }).join('');
+  return `<div class="chain-converge">${pulse.converged ? '同刻多支路汇合（' : ''}${chains.length} 条可复算因果路径${pulse.converged ? '）' : ''}</div>${rows}`;
 }
 
 function framesTable(frames, monitors, title) {
